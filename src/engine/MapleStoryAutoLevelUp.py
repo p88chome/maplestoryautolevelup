@@ -57,12 +57,16 @@ class MapleStoryAutoBot:
         self.idx_routes = 0 # Index of route map
         self.monsters_info = {} # monster information
         self.monsters = [] # monster detected in current frame
+        self._min_mob_area = 0 # cached minimum monster area (pixels²)
+        self._min_mob_height = 0 # cached minimum monster height (pixels)
+        self._monsters_contour_blur_cache = {} # monster_name -> [blurred_mask, ...]
         self.fps = 0 # Frame per second
         self.red_dot_center_prev = None # previous other player location in minimap
         self.video_writer = None # For video recording feature
         self.color_code = {} # For color code instruction
         self.color_code_up_down = {} # Color code only contain 'up' and 'down'
         self.thread_auto_bot = None # thread for running autobot
+        self._terminated_lock = threading.Lock()
         self.cmd_move_x = "none" # "left" "right"
         self.cmd_move_y = "none" # "up" "down"
         self.cmd_action = "none" # "jump" "attack" ....
@@ -200,6 +204,33 @@ class MapleStoryAutoBot:
                     return -1
                     # raise RuntimeError(f"No images found in monster/{monster_name}/{monster_name}*")
             logger.info(f"Loaded monsters: {list(self.monsters_info.keys())}")
+
+            # Cache minimum monster dimensions to avoid recomputing inside inner loops
+            self._min_mob_area = min(
+                img.shape[0] * img.shape[1]
+                for imgs in self.monsters_info.values()
+                for img, _ in imgs
+            )
+            self._min_mob_height = min(
+                img.shape[0]
+                for imgs in self.monsters_info.values()
+                for img, _ in imgs
+            )
+
+            # Precompute blurred monster masks for contour_only mode
+            if cfg["monster_detect"]["mode"] == "contour_only":
+                blur = cfg["monster_detect"]["contour_blur"]
+                self._monsters_contour_blur_cache = {}
+                for monster_name, imgs in self.monsters_info.items():
+                    self._monsters_contour_blur_cache[monster_name] = [
+                        cv2.GaussianBlur(
+                            np.all(img_m == [0, 0, 0], axis=2).astype(np.uint8) * 255,
+                            (blur, blur), 0
+                        )
+                        for img_m, _ in imgs
+                    ]
+                logger.info("[load_config] Precomputed contour blur cache for "
+                            f"{len(self._monsters_contour_blur_cache)} monster types")
 
         # Load player's name tag
         if cfg["nametag"]["enable"]:
@@ -479,21 +510,22 @@ class MapleStoryAutoBot:
         '''
         get_player_location_by_party_red_bar
         '''
-        # Zero out minimap area in the img_frame
-        img_frame = self.img_frame.copy()
-        x, y = self.loc_minimap
-        h, w = self.img_minimap.shape[:2]
-        img_frame[y:y+h, x:x+w] = 0
-
-        # Get camera area
-        img_camera = img_frame[:self.cfg["ui_coords"]["ui_y_start"], :]
+        # Get camera area (no full-frame copy needed)
+        ui_y = self.cfg["ui_coords"]["ui_y_start"]
+        img_camera = self.img_frame[:ui_y, :]
 
         # Convert to HSV
         img_hsv = cv2.cvtColor(img_camera, cv2.COLOR_BGR2HSV)
         lower_red = to_opencv_hsv(self.cfg["party_red_bar"]["lower_red"])
         upper_red = to_opencv_hsv(self.cfg["party_red_bar"]["upper_red"])
         mask_red = cv2.inRange(img_hsv, lower_red, upper_red)
-        # cv2.imshow("mask_red", mask_red)
+
+        # Mask out the minimap region in the result (avoids copying the full frame)
+        mm_x, mm_y = self.loc_minimap
+        mm_h, mm_w = self.img_minimap.shape[:2]
+        mm_y_end = min(mm_y + mm_h, ui_y)
+        if mm_y < ui_y:
+            mask_red[mm_y:mm_y_end, mm_x:mm_x + mm_w] = 0
 
         # Find contours on mask_red
         contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL,
@@ -595,28 +627,53 @@ class MapleStoryAutoBot:
         nearest_up_down = None
         min_dist = float('inf')
         min_dist_up_down = float('inf')
-        for y in range(y_min, y_max):
-            for x in range(x_min, x_max):
-                pixel = tuple(self.img_route[y, x])  # (R, G, B)
-                dist = abs(x - x0) + abs(y - y0)
-                # Get nearest color
-                if pixel in self.color_code and dist < min_dist:
-                    nearest = {
-                        "pixel": (x, y),
-                        "color": pixel,
-                        "command": self.color_code[pixel],
-                        "distance": dist
-                    }
-                    min_dist = dist
-                # Get nearest color (up, dowm)
-                if pixel in self.color_code_up_down and dist < min_dist_up_down:
-                    nearest_up_down = {
-                        "pixel": (x, y),
-                        "color": pixel,
-                        "command": self.color_code_up_down[pixel],
-                        "distance": dist
-                    }
-                    min_dist_up_down = dist
+
+        region = self.img_route[y_min:y_max, x_min:x_max]
+        rh, rw = region.shape[:2]
+        lx = x0 - x_min
+        ly = y0 - y_min
+
+        # Precompute Manhattan distance map for the search region
+        xs_idx = np.arange(rw)
+        ys_idx = np.arange(rh)
+        dist_map = np.abs(xs_idx[np.newaxis, :] - lx) + np.abs(ys_idx[:, np.newaxis] - ly)
+        _INT_MAX = np.iinfo(np.int32).max
+
+        for color_tuple, command in self.color_code.items():
+            color_arr = np.array(color_tuple, dtype=region.dtype)
+            mask = np.all(region == color_arr, axis=2)
+            if not np.any(mask):
+                continue
+            masked_dists = np.where(mask, dist_map, _INT_MAX)
+            flat_idx = int(np.argmin(masked_dists))
+            d = int(masked_dists.flat[flat_idx])
+            if d < min_dist:
+                ry, rx = np.unravel_index(flat_idx, dist_map.shape)
+                min_dist = d
+                nearest = {
+                    "pixel": (int(rx) + x_min, int(ry) + y_min),
+                    "color": color_tuple,
+                    "command": command,
+                    "distance": d,
+                }
+
+        for color_tuple, command in self.color_code_up_down.items():
+            color_arr = np.array(color_tuple, dtype=region.dtype)
+            mask = np.all(region == color_arr, axis=2)
+            if not np.any(mask):
+                continue
+            masked_dists = np.where(mask, dist_map, _INT_MAX)
+            flat_idx = int(np.argmin(masked_dists))
+            d = int(masked_dists.flat[flat_idx])
+            if d < min_dist_up_down:
+                ry, rx = np.unravel_index(flat_idx, dist_map.shape)
+                min_dist_up_down = d
+                nearest_up_down = {
+                    "pixel": (int(rx) + x_min, int(ry) + y_min),
+                    "color": color_tuple,
+                    "command": command,
+                    "distance": d,
+                }
 
         # Debug
         draw_rectangle(
@@ -730,8 +787,8 @@ class MapleStoryAutoBot:
             ih = max(0, iy2 - iy1)
             inter_area = iw * ih
 
-            min_mob_area = min(img.shape[0]*img.shape[1] for _, imgs in self.monsters_info.items() for img, _ in imgs)
-            inter_area_thres = min(min_mob_area, self.cfg['monster_detect']['max_mob_area_trigger'])
+            inter_area_thres = min(self._min_mob_area,
+                                   self.cfg['monster_detect']['max_mob_area_trigger'])
             if inter_area >= inter_area_thres:
                 # Compute distance to player center
                 monster_center = (mx1 + mw // 2, my1 + mh // 2)
@@ -766,69 +823,57 @@ class MapleStoryAutoBot:
         char_y_max = min(img_roi.shape[0], py_in_roi + self.cfg["character"]["height"] // 2)
 
         monsters = []
-        for monster_name, monster_imgs in self.monsters_info.items():
-            for img_monster, mask_monster in monster_imgs:
-                if self.cfg["bot"]["mode"] == "patrol":
-                    pass # Don't detect monster using template in patrol mode
-                elif self.cfg["monster_detect"]["mode"] == "template_free":
-                    # Generate mask where pixel is exactly (0,0,0)
-                    black_mask = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
-                    # cv2.imshow("Black Pixel Mask", black_mask)
+        detect_mode = self.cfg["monster_detect"]["mode"]
+        diff_thres = self.cfg["monster_detect"]["diff_thres"]
 
-                    # Zero out mask inside this region (ignore player's own character)
-                    black_mask[char_y_min:char_y_max, char_x_min:char_x_max] = 0
+        if self.cfg["bot"]["mode"] == "patrol":
+            pass  # No template detection in patrol mode
 
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-                    closed_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel)
-                    # cv2.imshow("Black Mask", closed_mask)
+        elif detect_mode == "template_free":
+            # Runs once - detection is independent of specific monster templates
+            black_mask = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
+            black_mask[char_y_min:char_y_max, char_x_min:char_x_max] = 0
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+            closed_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel)
+            draw_rectangle(
+                self.img_frame_debug, (char_x_min+x0, char_y_min+y0),
+                (self.cfg["character"]["height"], self.cfg["character"]["width"]),
+                (255, 0, 0), "Character Box"
+            )
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                closed_mask, connectivity=8)
+            min_area = 1000
+            for i in range(1, num_labels):
+                x, y, w, h, area = stats[i]
+                if area > min_area:
+                    monsters.append({
+                        "name": "",
+                        "position": (x0+x, y0+y),
+                        "size": (h, w),
+                        "score": 1.0,
+                    })
 
-                    # draw player character bounding box
-                    draw_rectangle(
-                        self.img_frame_debug, (char_x_min+x0, char_y_min+y0),
-                        (self.cfg["character"]["height"], self.cfg["character"]["width"]),
-                        (255, 0, 0), "Character Box"
-                    )
+        elif detect_mode == "contour_only":
+            # Precompute ROI blur once outside the per-monster loop
+            mask_roi = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
+            mask_roi[char_y_min:char_y_max, char_x_min:char_x_max] = 0
+            blur = self.cfg["monster_detect"]["contour_blur"]
+            img_roi_blur = cv2.GaussianBlur(mask_roi, (blur, blur), 0)
+            h_roi, w_roi = img_roi_blur.shape[:2]
 
-                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed_mask, connectivity=8)
-
-                    monsters = []
-                    min_area = 1000
-                    for i in range(1, num_labels):
-                        x, y, w, h, area = stats[i]
-                        if area > min_area:
-                            monsters.append({
-                                "name": "",
-                                "position": (x0+x, y0+y),
-                                "size": (h, w),
-                                "score": 1.0,
-                            })
-                elif self.cfg["monster_detect"]["mode"] == "contour_only":
-                    # Use only black lines contour to detect monsters
-                    # Create masks (already grayscale)
-                    mask_pattern = np.all(img_monster == [0, 0, 0], axis=2).astype(np.uint8) * 255
-                    mask_roi = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
-
-                    # Zero out mask inside this region (ignore player's own character)
-                    mask_roi[char_y_min:char_y_max, char_x_min:char_x_max] = 0
-
-                    # Apply Gaussian blur (soften the masks)
-                    blur = self.cfg["monster_detect"]["contour_blur"]
-                    img_monster_blur = cv2.GaussianBlur(mask_pattern, (blur, blur), 0)
-                    img_roi_blur = cv2.GaussianBlur(mask_roi, (blur, blur), 0)
-
-                    # Check template vs ROI size before matching
-                    h_roi, w_roi = img_roi_blur.shape[:2]
+            for monster_name, monster_imgs in self.monsters_info.items():
+                cached_blurs = self._monsters_contour_blur_cache.get(monster_name, [])
+                for idx, (img_monster, _mask_monster) in enumerate(monster_imgs):
+                    if idx < len(cached_blurs):
+                        img_monster_blur = cached_blurs[idx]
+                    else:
+                        mask_pattern = np.all(img_monster == [0, 0, 0], axis=2).astype(np.uint8) * 255
+                        img_monster_blur = cv2.GaussianBlur(mask_pattern, (blur, blur), 0)
                     h_temp, w_temp = img_monster_blur.shape[:2]
-
                     if h_temp > h_roi or w_temp > w_roi:
-                        return []  # template bigger than roi, skip this matching
-
-                    # Perform template matching
+                        continue
                     res = cv2.matchTemplate(img_roi_blur, img_monster_blur, cv2.TM_SQDIFF_NORMED)
-
-                    # Apply soft threshold
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
-
+                    match_locations = np.where(res <= diff_thres)
                     h, w = img_monster.shape[:2]
                     for pt in zip(*match_locations[::-1]):
                         monsters.append({
@@ -837,15 +882,17 @@ class MapleStoryAutoBot:
                             "size": (h, w),
                             "score": res[pt[1], pt[0]],
                         })
-                elif self.cfg["monster_detect"]["mode"] == "grayscale":
+
+        elif detect_mode == "grayscale":
+            # Precompute ROI grayscale once outside the per-monster loop
+            img_roi_gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
+            for monster_name, monster_imgs in self.monsters_info.items():
+                for img_monster, mask_monster in monster_imgs:
                     img_monster_gray = cv2.cvtColor(img_monster, cv2.COLOR_BGR2GRAY)
-                    img_roi_gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
                     res = cv2.matchTemplate(
-                            img_roi_gray,
-                            img_monster_gray,
-                            cv2.TM_SQDIFF_NORMED,
-                            mask=mask_monster)
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                        img_roi_gray, img_monster_gray,
+                        cv2.TM_SQDIFF_NORMED, mask=mask_monster)
+                    match_locations = np.where(res <= diff_thres)
                     h, w = img_monster.shape[:2]
                     for pt in zip(*match_locations[::-1]):
                         monsters.append({
@@ -853,14 +900,15 @@ class MapleStoryAutoBot:
                             "position": (pt[0] + x0, pt[1] + y0),
                             "size": (h, w),
                             "score": res[pt[1], pt[0]],
-                    })
-                elif self.cfg["monster_detect"]["mode"] == "color":
+                        })
+
+        elif detect_mode == "color":
+            for monster_name, monster_imgs in self.monsters_info.items():
+                for img_monster, mask_monster in monster_imgs:
                     res = cv2.matchTemplate(
-                            img_roi,
-                            img_monster,
-                            cv2.TM_SQDIFF_NORMED,
-                            mask=mask_monster)
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                        img_roi, img_monster,
+                        cv2.TM_SQDIFF_NORMED, mask=mask_monster)
+                    match_locations = np.where(res <= diff_thres)
                     h, w = img_monster.shape[:2]
                     for pt in zip(*match_locations[::-1]):
                         monsters.append({
@@ -868,10 +916,11 @@ class MapleStoryAutoBot:
                             "position": (pt[0] + x0, pt[1] + y0),
                             "size": (h, w),
                             "score": res[pt[1], pt[0]],
-                    })
-                else:
-                    logger.error(f"Unexpected camera localization mode: {self.cfg['monster_detect']['mode']}")
-                    return []
+                        })
+
+        else:
+            logger.error(f"Unexpected camera localization mode: {detect_mode}")
+            return []
 
         # Apply Non-Maximum Suppression to monster detection
         monsters = nms(monsters, iou_threshold=0.4)
@@ -897,7 +946,7 @@ class MapleStoryAutoBot:
                 x = max(0, x)
                 y = max(0, y)
                 w = 70
-                h = min(img.shape[0] for _, imgs in self.monsters_info.items() for img, _ in imgs)
+                h = self._min_mob_height
 
                 monsters.append({
                     "name": "Health Bar",
@@ -1245,11 +1294,16 @@ class MapleStoryAutoBot:
                 loc_login_button = self.get_login_button_location()
                 if loc_login_button is None:
                     logger.info("Waiting for login button to show up...")
-            except Exception as e:
-                logger.warning(f"Exception occurred while waiting for login button: {e}")
+            except cv2.error as e:
+                logger.warning(f"[channel_change] OpenCV error waiting for login button: {e}")
                 if not is_mac():
                     resize_window(window_title, width=1296, height=759)
-                logger.info("Retrying login button detection...")
+                logger.info("[channel_change] Retrying login button detection...")
+            except Exception as e:
+                logger.warning(f"[channel_change] Unexpected error waiting for login button: {e}")
+                if not is_mac():
+                    resize_window(window_title, width=1296, height=759)
+                logger.info("[channel_change] Retrying login button detection...")
 
             time.sleep(3)
         logger.info(f"login_button button found: {loc_login_button}")
@@ -1277,17 +1331,18 @@ class MapleStoryAutoBot:
         '''
         terminate all threads
         '''
-        # Terminate keyboard controller
-        if self.kb is not None:
-            self.kb.is_terminated = True
-        # Terminate game window capturor
-        if self.capture is not None:
-            self.capture.stop()
-        # Terminate health monitor
-        if self.health_monitor is not None:
-            self.health_monitor.stop()
-        self.is_terminated = True
-        logger.info(f"[terminate_threads] Terminated all threads")
+        with self._terminated_lock:
+            # Terminate keyboard controller
+            if self.kb is not None:
+                self.kb.is_terminated = True
+            # Terminate game window capturor
+            if self.capture is not None:
+                self.capture.stop()
+            # Terminate health monitor
+            if self.health_monitor is not None:
+                self.health_monitor.stop()
+            self.is_terminated = True
+        logger.info("[terminate_threads] Terminated all threads")
 
     def get_attack_direction(self, monster_left, monster_right):
         '''
@@ -1770,20 +1825,30 @@ class MapleStoryAutoBot:
 
             # Process one game window frame
             self.is_frame_done = False
-            ret = self.run_once()
+            try:
+                ret = self.run_once()
+            except cv2.error as e:
+                logger.error(f"[loop] OpenCV error in run_once: {e}")
+                ret = -1
+            except MemoryError:
+                logger.error("[loop] Out of memory in run_once, skipping frame")
+                ret = -1
+            except Exception as e:
+                logger.error(f"[loop] Unexpected error in run_once: {e}")
+                ret = -1
 
             # Only proceed if the frame is valid
             if ret == 0:
                 # Draw image on debug window
                 if self.is_show_debug_window and self.is_ui:
-                    img_frame_debug_emit = self.img_frame_debug[:
-                        self.cfg["ui_coords"]["ui_y_start"], :].copy()
-                    img_route_debug_emit = self.img_route_debug.copy()
-                    self.image_debug_signal.emit(img_frame_debug_emit)
-                    self.route_map_viz_signal.emit(img_route_debug_emit)
-            else:
-                pass
-                # logger.warning("Skipped debug window update due to invalid frame.")
+                    try:
+                        img_frame_debug_emit = self.img_frame_debug[:
+                            self.cfg["ui_coords"]["ui_y_start"], :].copy()
+                        img_route_debug_emit = self.img_route_debug.copy()
+                        self.image_debug_signal.emit(img_frame_debug_emit)
+                        self.route_map_viz_signal.emit(img_route_debug_emit)
+                    except Exception as e:
+                        logger.warning(f"[loop] Failed to emit debug frame: {e}")
 
             self.is_frame_done = True
 
